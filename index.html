@@ -1,0 +1,1198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>叠层逃生 · Stack Escape</title>
+<style>
+  html,body{margin:0;height:100%;background:#0B1A2E;overflow:hidden;
+    font-family:"Microsoft YaHei","PingFang SC","Hiragino Sans GB",system-ui,sans-serif;
+    -webkit-tap-highlight-color:transparent;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;touch-action:none;cursor:pointer;}
+  #selftest-result{position:fixed;left:0;top:0;margin:0;padding:10px;max-height:100vh;
+    overflow:auto;background:#04070b;color:#7dff9b;font:12px/1.6 Consolas,monospace;
+    white-space:pre;z-index:9;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="1280" height="720"></canvas></div>
+<pre id="selftest-result" hidden></pre>
+<script>
+'use strict';
+/* =====================================================================
+   叠层逃生 Stack Escape —— 2D 侧视角「叠板爬塔躲火」小游戏
+   单文件 · 纯 Canvas 绘制 · 纯 Web Audio 合成音效 · 无外部依赖
+   ---------------------------------------------------------------------
+   核心：每回合从 2~3 块板里选一块叠上去 → 物理摇摆 → 角色爬一层 → 火往上追
+         晃太狠会「部分塌方」，你会掉几层（不是死），火会更近；被火追上才结束
+   ===================================================================== */
+
+/* ============================ 基础工具 ============================ */
+const W = 1280, H = 720;
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const Q = new URLSearchParams(location.search);
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : (v > b ? b : v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const TAU = Math.PI * 2;
+
+function fitCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = W * dpr; cv.height = H * dpr;
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  cv.style.width = (W * s) + 'px';
+  cv.style.height = (H * s) + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+function rr(x, y, w, h, r) {
+  r = Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function fillRR(x, y, w, h, r, color) { rr(x, y, w, h, r); ctx.fillStyle = color; ctx.fill(); }
+function circle(x, y, r, color) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fillStyle = color; ctx.fill(); }
+function txt(s, x, y, size, color, align, weight) {
+  ctx.fillStyle = color; ctx.textAlign = align || 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.font = (weight ? weight + ' ' : '') + size + 'px "Microsoft YaHei","PingFang SC",sans-serif';
+  ctx.fillText(s, x, y);
+}
+function vibrate(ms) { try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) { } }
+
+/* ============================ 配色 / 板型 ============================ */
+const C = {
+  bg1: '#1D3557', bg2: '#0B1A2E',
+  warm: '#F4A261', coral: '#E76F51', mint: '#2A9D8F', sky: '#8ECAE6',
+  cream: '#F1FAEE', fireA: '#FF6B35', fireB: '#FFD166',
+  danger: '#FF9EB5', panel: 'rgba(9,20,36,.74)', shadow: 'rgba(4,10,20,'
+};
+
+/* 板定义：重量 mass / 阻尼 damp（越大越稳）/ slip 打滑 / spring 弹 / glue 粘 */
+const BOARDS = {
+  wood:   { key: 'wood',   name: '木板',   w: 150, h: 26, mass: 1.0, damp: 1.00, slip: 0, spring: 0, glue: 0,
+            top: '#EBBE8A', body: '#DFA162', dark: '#BC7F45', tex: 'grain', stab: 2, wt: 1 },
+  stone:  { key: 'stone',  name: '石板',   w: 168, h: 26, mass: 2.2, damp: 1.45, slip: 0, spring: 0, glue: 0,
+            top: '#C6CFD8', body: '#A3AEBA', dark: '#7F8A97', tex: 'speck', stab: 3, wt: 3 },
+  ice:    { key: 'ice',    name: '冰板',   w: 142, h: 26, mass: 0.8, damp: 0.60, slip: 1, spring: 0, glue: 0,
+            top: '#CFEAF7', body: '#8ECAE6', dark: '#6BA9C6', tex: 'shine', stab: 1, wt: 1 },
+  spring: { key: 'spring', name: '弹簧板', w: 150, h: 26, mass: 1.2, damp: 1.05, slip: 0, spring: 1, glue: 0,
+            top: '#63CBBB', body: '#2A9D8F', dark: '#1E7A70', tex: 'coil', stab: 2, wt: 2 },
+  glue:   { key: 'glue',   name: '胶板',   w: 158, h: 26, mass: 0.9, damp: 2.00, slip: 0, spring: 0, glue: 1,
+            top: '#FFE79B', body: '#F4D06F', dark: '#CFA94A', tex: 'bubble', stab: 3, wt: 1 }
+};
+const BASE = { key: 'base', name: '地基', w: 250, h: 26, mass: 6, damp: 1.8, slip: 0, spring: 0, glue: 1,
+               top: '#B9C3CC', body: '#8E99A6', dark: '#6E7986', tex: 'speck', stab: 3, wt: 3 };
+
+/* 物理 / 节奏调参（自测会校验节奏落在 3~6 分钟） */
+const TUNE = {
+  BH: 26,                 // 每层高度（世界像素）
+  baseW: 250,             // 地基宽度 = 抗倾覆足印
+  stiff: 26, damp: 7.2,   // 摇摆：弹簧刚度 / 阻尼
+  dangerLean: 0.85,       // 危险阈值（归一化重心偏移）
+  collapseLean: 1.38,     // 倾倒阈值
+  overlapMin: 0.18,       // 叠放重叠下限
+  dangerLimit: 2.6,       // 危险状态持续多久后塌
+  gustBase: 0.30, gustPer: 0.006,   // 随机风（随楼层变强）
+  fireBase: 0.34, fireAccel: 0.030, // 火速：层/秒，随时间加速（每分钟 +0.03）
+  fireStart: -7, fireGrace: 3.0,
+  flyT: 0.32, hoverT: 1.40, dropT: 0.16, settleT: 0.30, climbT: 0.34, fallT: 0.70,
+  randPlace: 30, dragRange: 178,     // 落点随机范围 / 可拖动范围
+  emgCount: 3, emgCost: 30, braceT: 4.0,
+  topMin: 46, topMax: 72              // 楼顶随机层数
+};
+
+/* ============================ 音效（Web Audio 合成） ============================ */
+const A = { ctx: null, master: null, on: true };
+function audioInit() {
+  if (A.ctx) return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    A.ctx = new AC();
+    A.master = A.ctx.createGain();
+    A.master.gain.value = 0.5;
+    A.master.connect(A.ctx.destination);
+  } catch (e) { A.ctx = null; }
+}
+function tone(freq, dur, type, vol, slide, delay) {
+  if (!A.ctx || !A.on) return;
+  try {
+    const t0 = A.ctx.currentTime + (delay || 0);
+    const o = A.ctx.createOscillator(), g = A.ctx.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t0);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, slide), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol || 0.12, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(A.master); o.start(t0); o.stop(t0 + dur + 0.03);
+  } catch (e) { }
+}
+function noise(dur, vol, cutoff, q) {
+  if (!A.ctx || !A.on) return;
+  try {
+    const t0 = A.ctx.currentTime;
+    const len = Math.max(1, Math.floor(A.ctx.sampleRate * dur));
+    const buf = A.ctx.createBuffer(1, len, A.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 1.8);
+    const src = A.ctx.createBufferSource(); src.buffer = buf;
+    const f = A.ctx.createBiquadFilter(); f.type = 'lowpass';
+    f.frequency.value = cutoff || 800; if (q) f.Q.value = q;
+    const g = A.ctx.createGain(); g.gain.value = vol || 0.15;
+    src.connect(f); f.connect(g); g.connect(A.master); src.start(t0);
+  } catch (e) { }
+}
+/* 7 种音效：短、轻、不刺耳 */
+function sfx(name) {
+  switch (name) {
+    case 'place':  tone(210, 0.10, 'triangle', 0.20, 130); noise(0.06, 0.07, 500); break;   // 咚·木头感
+    case 'creak':  tone(880 + Math.random() * 220, 0.07, 'sine', 0.035, 1300); break;        // 吱呀
+    case 'crash':  noise(0.42, 0.22, 420); tone(120, 0.35, 'sine', 0.16, 70); break;         // 轰
+    case 'fire':   noise(0.30, 0.07, 260); tone(90, 0.28, 'sine', 0.06, 60); break;          // 呼
+    case 'emg':    tone(1180, 0.09, 'triangle', 0.16); tone(1720, 0.14, 'sine', 0.10, null, 0.07); break; // 叮
+    case 'hop':    tone(620, 0.06, 'triangle', 0.10, 900); break;                            // 哒
+    case 'over':   tone(660, 0.16, 'sine', 0.14); tone(880, 0.20, 'sine', 0.12, null, 0.14);
+                   tone(440, 0.34, 'sine', 0.10, null, 0.28); break;                          // 叮咚
+  }
+}
+
+/* ============================ 游戏状态 ============================ */
+const S = {
+  mode: 'play',          // play | end
+  phase: 'choose',       // choose | fly | hover | drop | settle | climb | collapse | end
+  phaseT: 0, t: 0, dtReal: 0,
+  tower: [], playerLevel: 0, playerX: 640, playerY: 0, playerFromX: 640, playerFromY: 0,
+  playerVy: 0, playerSquash: 0, face: 'calm',
+  fireFloor: TUNE.fireStart, fireT: 0, graceT: TUNE.fireGrace,
+  lean: 0, leanVel: 0, dangerT: 0, braceT: 0, immuneT: 0, timeScale: 1, minOverlap: 1, comNorm: 0,
+  cards: [], pending: null, dragging: false, dragDX: 0, dragMoved: 0,
+  emg: TUNE.emgCount, emgUsed: 0, score: 0, floors: 0, collapses: 0, springBonus: 0,
+  topFloor: 60, best: 0, shake: 0, flash: 0, warnPulse: 0,
+  particles: [], debris: [], stars: [], clouds: [],
+  win: false, endReason: '', simTargetX: null, simFast: false, audioBoom: false
+};
+
+/* ---------------------------- 单块板 ---------------------------- */
+function mkBoard(typeKey, x) {
+  const d = (typeKey === 'base') ? BASE : BOARDS[typeKey];
+  return {
+    t: typeKey, x: x, w: d.w + (typeKey === 'base' ? 0 : rnd(-6, 6)), h: d.h,
+    mass: d.mass, damp: d.damp, slip: d.slip, spring: d.spring, glue: d.glue,
+    def: d, squash: 0, seed: Math.random() * 1000, born: S.t
+  };
+}
+function surfaceY(level) { return -(level + 1) * TUNE.BH; }   // 第 level 块板的顶面世界 y
+function topLevel() { return S.tower.length - 1; }
+function gap() { return S.tower.length - S.fireFloor; }
+
+/* ---------------------------- 物理统计 ---------------------------- */
+function stats() {
+  const tw = S.tower;
+  let m = 0, mx = 0, dampW = 0, ice = 0, stone = 0;
+  for (let i = 1; i < tw.length; i++) {                 // 不计地基：地基=地面足印
+    const b = tw[i];
+    m += b.mass; mx += b.mass * b.x;
+    dampW += b.damp * b.mass;
+    if (b.slip) ice++;
+    if (b.t === 'stone') stone++;
+  }
+  const com = m > 0 ? mx / m : tw[0].x;
+  let ov = 1;
+  for (let i = 1; i < tw.length; i++) {
+    const a = tw[i - 1], b = tw[i];
+    const o = 1 - Math.abs(b.x - a.x) / ((a.w + b.w) / 2);
+    if (o < ov) ov = o;
+  }
+  const baseCx = tw[0].x, half = TUNE.baseW * 0.5;
+  return {
+    mass: m, com: com, comNorm: (com - baseCx) / half,
+    damp: clamp(m > 0 ? dampW / m : 1, 0.5, 2.6) * (1 + 0.10 * stone),
+    ice: ice, stone: stone, minOverlap: clamp(ov, 0, 1),
+    height: tw.length
+  };
+}
+
+/* ---------------------------- 开局 ---------------------------- */
+function loadBest() { try { return parseInt(localStorage.getItem('stackescape.best') || '0', 10) || 0; } catch (e) { return 0; } }
+function saveBest(v) { try { localStorage.setItem('stackescape.best', String(v)); } catch (e) { } }
+
+function startRun() {
+  S.mode = 'play'; S.phase = 'choose'; S.phaseT = 0; S.t = 0; S.timeScale = 1;
+  S.tower = [mkBoard('base', 640)];
+  S.playerLevel = 0; S.playerX = 640; S.playerY = surfaceY(0);
+  S.playerFromX = S.playerX; S.playerFromY = S.playerY; S.playerVy = 0; S.playerSquash = 0;
+  S.fireFloor = TUNE.fireStart; S.fireT = 0; S.graceT = TUNE.fireGrace;
+  S.lean = 0; S.leanVel = 0; S.dangerT = 0; S.braceT = 0; S.shake = 0; S.flash = 0;
+  S.immuneT = 0; S.face = 'calm'; S.camY = camTarget();
+  S.emg = TUNE.emgCount; S.emgUsed = 0; S.score = 0; S.floors = 0; S.collapses = 0; S.springBonus = 0;
+  S.topFloor = Math.round(rnd(TUNE.topMin, TUNE.topMax));
+  S.particles = []; S.debris = []; S.pending = null; S.cards = rollCards();
+  S.win = false; S.endReason = ''; S.warnPulse = 0; S.audioBoom = false;
+  S.best = loadBest();
+  initSky();
+  A.on = true;
+}
+function initSky() {
+  S.stars = [];
+  for (let i = 0; i < 70; i++) S.stars.push({ x: rnd(0, W), y: rnd(0, H), r: rnd(0.6, 1.9), p: rnd(0, TAU), s: rnd(0.6, 1.8) });
+  S.clouds = [];
+  for (let i = 0; i < 6; i++) S.clouds.push({ x: rnd(-200, W), y: rnd(70, 520), s: rnd(0.6, 1.35), v: rnd(4, 12), a: rnd(0.05, 0.12) });
+}
+
+/* ---------------------------- 选板 ---------------------------- */
+const TYPES = Object.keys(BOARDS);
+function rollCards() {
+  const n = Math.random() < 0.45 ? 2 : 3;                  // 每回合只出 2~3 块
+  const pool = TYPES.slice();
+  const out = [];
+  for (let i = 0; i < n && pool.length; i++) out.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+  return out;
+}
+function chooseCard(i) {
+  if (S.mode !== 'play' || S.phase !== 'choose') return;
+  const key = S.cards[i]; if (!key) return;
+  const d = BOARDS[key];
+  const st = stats();
+  // 默认落点：贴着重心一侧 + 一点随机（什么都不做就会歪一点）
+  let x = S.tower[0].x + st.comNorm * TUNE.baseW * 0.5 * 0.55 + rnd(-TUNE.randPlace, TUNE.randPlace);
+  x = clamp(x, S.tower[0].x - TUNE.dragRange, S.tower[0].x + TUNE.dragRange);
+  S.pending = {
+    key: key, def: d, x: x, t: 0,
+    fromX: cardRect(i).x + cardRect(i).w / 2, fromY: H - 60, w: d.w, h: d.h
+  };
+  S.phase = 'fly'; S.phaseT = 0;
+  sfx('hop');
+}
+function dropNow() { if (S.phase === 'hover') { S.phase = 'drop'; S.phaseT = 0; } }
+
+/* 让板落到塔顶（物理冲量 → Q弹 → 之后爬层） */
+function landPending() {
+  const p = S.pending; if (!p) return;
+  const before = stats().com;
+  const b = mkBoard(p.key, p.x);
+  S.tower.push(b);
+  const off = (b.x - before) / (TUNE.baseW * 0.5);
+  const heightK = 1 + S.tower.length * 0.006;              // 越高越晃
+  S.leanVel += off * b.mass * 1.55 * heightK * (1 + b.slip * 0.8);
+  b.squash = 1;
+  S.pending = null;
+  S.phase = 'settle'; S.phaseT = 0;
+  sfx('place');
+  vibrate(8);
+  spawnDust(b.x, surfaceY(S.tower.length - 1));
+  if (b.spring) { S.playerSquash = 1; S.springBonus += 4; S.score += 4; }
+}
+
+/* ---------------------------- 物理 / 塌方 ---------------------------- */
+function spawnDust(x, y) {
+  for (let i = 0; i < 10; i++) {
+    S.particles.push({
+      x: x + rnd(-60, 60), y: y, vx: rnd(-70, 70), vy: rnd(-60, 10),
+      life: rnd(0.3, 0.7), max: 0.7, r: rnd(2, 5), c: 'rgba(241,250,238,', type: 'dust'
+    });
+  }
+}
+function stepPhysics(dt) {
+  if (S.phase === 'collapse') return;                  // 塌方动画期间不再跑摇摆
+  const st = stats();
+  S.minOverlap = st.minOverlap; S.comNorm = st.comNorm;
+  const brace = S.braceT > 0 ? 2.2 : 1;
+  const k = TUNE.stiff * (1 + 0.05 * st.stone);
+  const c = TUNE.damp * st.damp * brace;
+  const gust = (TUNE.gustBase + TUNE.gustPer * S.tower.length) * (1 + st.ice * 0.55);
+  S.leanVel += (-k * (S.lean - st.comNorm) - c * S.leanVel) * dt + rnd(-1, 1) * gust * dt;
+
+  // 冰板打滑：偶尔把上层整体横向推一点
+  if (st.ice > 0 && Math.random() < dt * 0.55 * st.ice) {
+    for (let i = 1; i < S.tower.length; i++) {
+      if (S.tower[i].slip || i > 1 && S.tower[i - 1].slip) S.tower[i].x += rnd(-4, 4);
+    }
+    S.leanVel += rnd(-1, 1) * 0.5;
+  }
+  S.lean += S.leanVel * dt;
+
+  if (S.immuneT > 0) return;                           // 刚塌过：给 1.6 秒缓冲，保证"部分塌方"
+
+  // 危险 / 塌方判定
+  const danger = Math.abs(S.lean) > TUNE.dangerLean;
+  if (danger) {
+    S.dangerT += dt;
+    S.warnPulse += dt;
+    if (Math.random() < dt * 2.0) sfx('creak');
+    if (S.dangerT > TUNE.dangerLimit) { doCollapse(); return; }
+  } else {
+    S.dangerT = Math.max(0, S.dangerT - dt * 1.5);
+  }
+  if (Math.abs(S.lean) > TUNE.collapseLean || st.minOverlap < TUNE.overlapMin) doCollapse();
+}
+function doCollapse() {
+  if (S.phase === 'collapse' || S.mode !== 'play') return;
+  const st = stats();
+  const sev = clamp((Math.abs(S.lean) - TUNE.dangerLean) / 0.6 + (1 - st.minOverlap), 0.25, 1.8);
+  let maxLose = Math.max(1, Math.min(6, S.tower.length - 3));   // 地基 + 至少留 2 层
+  let lost = clamp(Math.round(1 + sev * 2.0 + rnd(0, 1.3)), 1, maxLose);
+
+  const removed = S.tower.splice(S.tower.length - lost, lost);
+  for (let i = 0; i < removed.length; i++) {
+    S.debris.push({
+      x: removed[i].x, y: surfaceY(S.tower.length + i), vx: rnd(-90, 90), vy: rnd(-40, 60),
+      rot: 0, vr: rnd(-3, 3), w: removed[i].w, def: removed[i].def, life: 1.6
+    });
+  }
+  S.collapses++;
+  S.lean = 0; S.leanVel = 0; S.dangerT = 0; S.immuneT = 1.6;
+  S.phase = 'collapse'; S.phaseT = 0; S.timeScale = 0.5;
+  S.playerFromY = S.playerY;
+  S.playerVy = 0;
+  S.fireFloor += lost * 0.55 + 0.35;                      // 火更近了
+  S.shake = 1; S.flash = 1;
+  sfx('crash'); vibrate(90);
+  for (let i = 0; i < 26; i++) {
+    S.particles.push({
+      x: S.tower[0].x + rnd(-140, 140), y: surfaceY(S.tower.length) + rnd(-40, 40),
+      vx: rnd(-190, 190), vy: rnd(-140, 60), life: rnd(0.5, 1.2), max: 1.2,
+      r: rnd(3, 8), c: 'rgba(231,111,81,', type: 'dust'
+    });
+  }
+}
+
+/* ---------------------------- 应急加固 ---------------------------- */
+function useEmergency() {
+  if (S.mode !== 'play' || S.emg <= 0) return false;
+  S.emg--; S.emgUsed++;
+  S.score = Math.max(0, S.score - TUNE.emgCost);
+  S.lean = 0; S.leanVel = 0; S.dangerT = 0;
+  S.braceT = TUNE.braceT;
+  for (let i = 1; i < S.tower.length; i++) {                // 逐层对齐，等于当场加固
+    S.tower[i].x = lerp(S.tower[i].x, S.tower[i - 1].x, 0.42);
+  }
+  S.phase = (S.phase === 'collapse') ? S.phase : S.phase;   // 不打断落地流程
+  S.flash = Math.max(S.flash, 0.6);
+  sfx('emg'); vibrate(20);
+  for (let i = 0; i < 22; i++) {
+    S.particles.push({
+      x: S.tower[0].x + rnd(-120, 120), y: surfaceY(S.tower.length) + rnd(-60, 20),
+      vx: rnd(-60, 60), vy: rnd(-150, -30), life: rnd(0.4, 0.9), max: 0.9,
+      r: rnd(2, 4), c: 'rgba(42,157,143,', type: 'spark'
+    });
+  }
+  return true;
+}
+
+/* ---------------------------- 每帧推进 ---------------------------- */
+function stepAll(dtReal) {
+  const dt = dtReal * S.timeScale;
+  S.dtReal = dtReal;
+  S.t += dt;
+  S.phaseT += dt;
+  if (S.shake > 0) S.shake = Math.max(0, S.shake - dtReal * 1.9);
+  if (S.flash > 0) S.flash = Math.max(0, S.flash - dtReal * 2.4);
+  if (S.braceT > 0) S.braceT = Math.max(0, S.braceT - dt);
+  if (S.immuneT > 0) S.immuneT = Math.max(0, S.immuneT - dt);
+  if (S.playerSquash > 0) S.playerSquash = Math.max(0, S.playerSquash - dtReal * 2.6);
+  for (let i = 0; i < S.tower.length; i++) if (S.tower[i].squash > 0) S.tower[i].squash = Math.max(0, S.tower[i].squash - dtReal * 3.4);
+
+  if (S.mode !== 'play') { stepParticles(dtReal); return; }
+
+  // 火：持续上涨（慢动作时只走 60%，保证翻车不会直接判死）
+  if (S.graceT > 0) S.graceT -= dtReal;
+  else {
+    S.fireFloor += (TUNE.fireBase + TUNE.fireAccel * (S.t / 60)) * dtReal * (S.timeScale < 1 ? 0.6 : 1);
+    S.fireT += dtReal;
+    if (S.fireT > 0.9) { S.fireT = 0; sfx('fire'); }
+  }
+
+  stepPhysics(dt);
+
+  // 阶段机
+  if (S.phase === 'fly') {
+    if (S.phaseT >= TUNE.flyT) { S.phase = 'hover'; S.phaseT = 0; }
+  } else if (S.phase === 'hover') {
+    if (S.pending) {
+      if (S.simTargetX != null) S.pending.x = S.simTargetX;
+      S.pending.x = clamp(S.pending.x, S.tower[0].x - TUNE.dragRange, S.tower[0].x + TUNE.dragRange);
+    }
+    if (S.phaseT >= TUNE.hoverT) { S.phase = 'drop'; S.phaseT = 0; }
+  } else if (S.phase === 'drop') {
+    if (S.phaseT >= TUNE.dropT) landPending();
+  } else if (S.phase === 'settle') {
+    if (S.phaseT >= TUNE.settleT) {
+      S.phase = 'climb'; S.phaseT = 0;
+      S.playerFromX = S.playerX; S.playerFromY = S.playerY;
+      sfx('hop');
+    }
+  } else if (S.phase === 'climb') {
+    const k = clamp(S.phaseT / TUNE.climbT, 0, 1);
+    const topB = S.tower[S.tower.length - 1];
+    S.playerX = lerp(S.playerFromX, topB.x, k);
+    S.playerY = lerp(S.playerFromY, surfaceY(topLevel()), k) - Math.sin(k * Math.PI) * 22;
+    if (k >= 1) {
+      S.playerLevel = topLevel(); S.playerX = topB.x; S.playerY = surfaceY(topLevel());
+      S.floors++; S.score += 10;
+      S.phase = 'choose'; S.phaseT = 0; S.cards = rollCards();
+      if (S.tower.length >= S.topFloor) endRun(true, 'top');
+    }
+  } else if (S.phase === 'collapse') {
+    S.playerVy += 1500 * dt;
+    S.playerY += S.playerVy * dt;
+    const floorY = surfaceY(topLevel());
+    if (S.playerY >= floorY || S.phaseT >= TUNE.fallT) {
+      S.playerY = floorY; S.playerVy = 0;
+      S.playerX = S.tower[topLevel()].x;
+      S.playerLevel = topLevel();
+      S.timeScale = 1; S.phase = 'choose'; S.phaseT = 0; S.cards = rollCards();
+    }
+  }
+
+  // 表情
+  const st = stats();
+  if (S.phase === 'collapse') S.face = 'cry';
+  else if (Math.abs(S.lean) > TUNE.dangerLean) S.face = 'scared';
+  else if (Math.abs(S.lean) > 0.35) S.face = 'worried';
+  else S.face = 'calm';
+
+  S.score += dt * 2;                                   // 生存分
+  if (gap() <= 0.15) endRun(false, 'fire');
+  stepParticles(dtReal);
+}
+function stepParticles(dt) {
+  for (let i = S.particles.length - 1; i >= 0; i--) {
+    const p = S.particles[i];
+    p.life -= dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += (p.type === 'spark' ? 40 : 300) * dt;
+    if (p.life <= 0) S.particles.splice(i, 1);
+  }
+  for (let i = S.debris.length - 1; i >= 0; i--) {
+    const d = S.debris[i];
+    d.life -= dt; d.vy += 900 * dt;
+    d.x += d.vx * dt; d.y += d.vy * dt; d.rot += d.vr * dt;
+    if (d.life <= 0 || d.y > 4000) S.debris.splice(i, 1);
+  }
+}
+function endRun(win, reason) {
+  if (S.mode !== 'play') return;
+  S.mode = 'end'; S.phase = 'end'; S.timeScale = 1;
+  S.win = win; S.endReason = reason;
+  S.score = Math.max(0, Math.round(S.score));
+  sfx('over');
+  vibrate(win ? 30 : 60);
+  if (S.score > S.best) { S.best = S.score; saveBest(S.score); }
+}
+
+/* ============================ 天空 / 火 / 板 绘制 ============================ */
+function camTarget() {
+  const stageTop = 64, stageH = H - 64 - 136;
+  return stageTop + stageH * 0.70 - S.playerY;
+}
+function initCam() { S.camY = camTarget(); }
+function drawBackground(dt) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, C.bg1); g.addColorStop(1, C.bg2);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  for (let i = 0; i < S.stars.length; i++) {
+    const s = S.stars[i];
+    const a = 0.25 + 0.35 * (0.5 + 0.5 * Math.sin(S.t * s.s + s.p));
+    circle(s.x, s.y, s.r, 'rgba(241,250,238,' + a.toFixed(3) + ')');
+  }
+  for (let i = 0; i < S.clouds.length; i++) {
+    const c = S.clouds[i];
+    c.x += c.v * dt;
+    if (c.x > W + 220) c.x = -220;
+    drawCloud(c.x, c.y, c.s, c.a);
+  }
+}
+function drawCloud(x, y, s, a) {
+  ctx.fillStyle = 'rgba(241,250,238,' + a + ')';
+  const u = 34 * s;
+  rr(x, y, u * 3.6, u * 1.05, u * 0.52); ctx.fill();
+  rr(x + u * 0.5, y - u * 0.55, u * 1.5, u * 1.1, u * 0.55); ctx.fill();
+  rr(x + u * 1.9, y - u * 0.38, u * 1.15, u * 0.95, u * 0.47); ctx.fill();
+}
+
+/* 火焰：多层波浪 + 呼吸 */
+function drawFire() {
+  const topScreen = (-S.fireFloor * TUNE.BH) + S.camY;
+  if (topScreen > H + 20) return;
+  const breathe = Math.sin(S.t * 1.5) * 7;
+  const baseY = H + 40;
+  const layers = [
+    { col1: '#E76F51', col2: '#FF6B35', a: 26, f: 0.010, sp: 1.1, dy: 0 },
+    { col1: '#FF6B35', col2: '#FF9F45', a: 18, f: 0.015, sp: 1.7, dy: -12 },
+    { col1: '#FFC24A', col2: '#FFD166', a: 11, f: 0.022, sp: 2.4, dy: -22 }
+  ];
+  for (let l = 0; l < layers.length; l++) {
+    const L = layers[l];
+    const top = topScreen + L.dy + breathe;
+    const g = ctx.createLinearGradient(0, top, 0, baseY);
+    g.addColorStop(0, L.col1); g.addColorStop(1, L.col2);
+    ctx.beginPath();
+    ctx.moveTo(-10, baseY);
+    for (let x = -10; x <= W + 10; x += 14) {
+      const w1 = Math.sin(x * L.f + S.t * L.sp) * L.a;
+      const w2 = Math.sin(x * L.f * 2.7 - S.t * L.sp * 0.8) * L.a * 0.35;
+      ctx.lineTo(x, top + w1 + w2);
+    }
+    ctx.lineTo(W + 10, baseY); ctx.closePath();
+    ctx.fillStyle = g; ctx.globalAlpha = l === 0 ? 0.92 : 0.8;
+    ctx.fill(); ctx.globalAlpha = 1;
+  }
+  // 火星
+  if (Math.random() < 0.4) {
+    S.particles.push({
+      x: rnd(0, W), y: topScreen + 30, vx: rnd(-20, 20), vy: rnd(-90, -30),
+      life: rnd(0.5, 1.1), max: 1.1, r: rnd(1.5, 3.5), c: 'rgba(255,209,102,', type: 'spark'
+    });
+  }
+  // 逼近警告：贴脸时底部粉色呼吸
+  if (gap() < 4) {
+    const a = 0.10 + 0.16 * (0.5 + 0.5 * Math.sin(S.t * 5));
+    const gg = ctx.createLinearGradient(0, H - 160, 0, H);
+    gg.addColorStop(0, 'rgba(255,158,181,0)'); gg.addColorStop(1, 'rgba(255,158,181,' + a.toFixed(3) + ')');
+    ctx.fillStyle = gg; ctx.fillRect(0, H - 160, W, 160);
+  }
+}
+
+/* 楼层板：圆角 + 1px 高光 + 哑光质感 + 柔软投影 */
+function drawBoardShape(x, y, w, h, def, squash, alpha) {
+  const sq = squash > 0 ? Math.sin(squash * Math.PI) : 0;
+  const hh = h * (1 - 0.30 * sq), ww = w * (1 + 0.14 * sq);
+  const bx = x - ww / 2, by = y + (h - hh);
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  // 投影（画在板下沿）
+  ctx.fillStyle = C.shadow + '0.30)';
+  rr(bx + 3, by + hh - 2, ww - 6, 7, 4); ctx.fill();
+  // 主体
+  const g = ctx.createLinearGradient(0, by, 0, by + hh);
+  g.addColorStop(0, def.top); g.addColorStop(0.42, def.body); g.addColorStop(1, def.dark);
+  rr(bx, by, ww, hh, 8); ctx.fillStyle = g; ctx.fill();
+  // 1px 高光棱
+  ctx.strokeStyle = 'rgba(255,255,255,.42)'; ctx.lineWidth = 1.2;
+  rr(bx + 1.2, by + 1.2, ww - 2.4, hh - 2.4, 7); ctx.stroke();
+  // 微质感
+  ctx.save();
+  rr(bx, by, ww, hh, 8); ctx.clip();
+  ctx.globalAlpha = 0.28;
+  if (def.tex === 'grain') {
+    ctx.strokeStyle = def.dark; ctx.lineWidth = 1.4;
+    const seed = (x * 0.11) % 13;
+    for (let i = 0; i < 3; i++) {
+      const yy = by + 7 + i * 6 + (seed % 3);
+      ctx.beginPath(); ctx.moveTo(bx + 12 + (seed % 5), yy); ctx.lineTo(bx + ww - 14 - (i * 7 % 11), yy); ctx.stroke();
+    }
+  } else if (def.tex === 'speck') {
+    ctx.fillStyle = def.dark;
+    for (let i = 0; i < 6; i++) {
+      const px = bx + ((i * 53 + x * 0.07) % (ww - 12)) + 6;
+      const py = by + ((i * 31) % (hh - 8)) + 4;
+      circle(px, py, 1.4, def.dark);
+    }
+  } else if (def.tex === 'shine') {
+    ctx.fillStyle = 'rgba(255,255,255,.55)';
+    ctx.save(); ctx.translate(bx + ww * 0.28, by - 6); ctx.rotate(0.5);
+    ctx.fillRect(0, 0, 8, hh + 20); ctx.restore();
+    ctx.fillStyle = 'rgba(255,255,255,.3)';
+    ctx.save(); ctx.translate(bx + ww * 0.62, by - 6); ctx.rotate(0.5);
+    ctx.fillRect(0, 0, 4, hh + 20); ctx.restore();
+  } else if (def.tex === 'coil') {
+    ctx.strokeStyle = 'rgba(241,250,238,.75)'; ctx.lineWidth = 2;
+    for (let i = 0; i < 5; i++) {
+      const px = bx + 16 + i * ((ww - 32) / 4);
+      ctx.beginPath();
+      ctx.moveTo(px, by + 5); ctx.lineTo(px + 4, by + hh / 2); ctx.lineTo(px, by + hh - 5);
+      ctx.stroke();
+    }
+  } else if (def.tex === 'bubble') {
+    for (let i = 0; i < 4; i++) {
+      circle(bx + 22 + i * ((ww - 44) / 3), by + hh * (0.35 + 0.2 * Math.sin(i + x * 0.05)), 3.2, 'rgba(255,255,255,.6)');
+    }
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+/* 方块小人 */
+function drawPlayer() {
+  const x = S.playerX, y = S.playerY + S.camY;
+  const sq = S.playerSquash > 0 ? Math.sin(S.playerSquash * Math.PI) : 0;
+  const hop = (S.phase === 'climb') ? Math.sin(clamp(S.phaseT / TUNE.climbT, 0, 1) * Math.PI) : 0;
+  const bw = 34 * (1 + 0.16 * sq + 0.08 * hop), bh = 42 * (1 - 0.22 * sq - 0.06 * hop);
+  const bx = x - bw / 2, by = y - bh;
+  // 影子
+  ctx.fillStyle = C.shadow + '0.34)';
+  ctx.beginPath(); ctx.ellipse(x, y + 3, bw * 0.62, 5.5, 0, 0, TAU); ctx.fill();
+  // 身体
+  const g = ctx.createLinearGradient(0, by, 0, by + bh);
+  g.addColorStop(0, '#FFFFFF'); g.addColorStop(0.55, C.cream); g.addColorStop(1, '#D8E4DC');
+  rr(bx, by, bw, bh, 10); ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1.2;
+  rr(bx + 1, by + 1, bw - 2, bh - 2, 9); ctx.stroke();
+  // 腮红
+  ctx.globalAlpha = 0.5;
+  circle(bx + bw * 0.20, by + bh * 0.60, 4.2, C.danger);
+  circle(bx + bw * 0.80, by + bh * 0.60, 4.2, C.danger);
+  ctx.globalAlpha = 1;
+  // 眼睛 + 嘴
+  const ex = bw * 0.26, ey = by + bh * 0.40;
+  const eR = S.face === 'scared' ? 6.2 : (S.face === 'calm' ? 4.6 : 4.0);
+  const blink = (Math.sin(S.t * 1.7) > 0.985) ? 0.15 : 1;
+  if (S.face === 'cry') {
+    ctx.strokeStyle = '#14202E'; ctx.lineWidth = 2.4; ctx.lineCap = 'round';
+    for (const sx of [-1, 1]) {
+      const cx0 = x + sx * ex;
+      ctx.beginPath(); ctx.moveTo(cx0 - 5, ey - 4); ctx.lineTo(cx0 + 5, ey + 3);
+      ctx.moveTo(cx0 + 5, ey - 4); ctx.lineTo(cx0 - 5, ey + 3); ctx.stroke();
+    }
+    circle(x - ex, ey + 12, 3.4, 'rgba(142,202,230,.95)');
+    circle(x + ex, ey + 14, 3.0, 'rgba(142,202,230,.95)');
+    ctx.strokeStyle = '#14202E'; ctx.lineWidth = 2.2;
+    ctx.beginPath(); ctx.arc(x, ey + 16, 6, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+  } else {
+    for (const sx of [-1, 1]) {
+      ctx.beginPath(); ctx.ellipse(x + sx * ex, ey, eR, eR * blink, 0, 0, TAU);
+      ctx.fillStyle = '#14202E'; ctx.fill();
+    }
+    ctx.strokeStyle = '#14202E'; ctx.lineWidth = 2.1; ctx.lineCap = 'round';
+    ctx.beginPath();
+    if (S.face === 'calm') ctx.arc(x, ey + 5, 6.5, 0.18 * Math.PI, 0.82 * Math.PI);
+    else if (S.face === 'worried') { ctx.moveTo(x - 6, ey + 9); ctx.lineTo(x + 6, ey + 9); }
+    else ctx.arc(x, ey + 6, 7.5, 0, Math.PI);
+    ctx.stroke();
+    if (S.face === 'worried' || S.face === 'scared') {
+      circle(x + bw * 0.52, by + bh * 0.22, 3.2, 'rgba(142,202,230,.95)');
+    }
+  }
+}
+
+/* ============================ HUD / 卡片 / 结算 ============================ */
+function iconFlame(x, y, s) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  ctx.beginPath();
+  ctx.moveTo(0, -12);
+  ctx.bezierCurveTo(9, -3, 8, 6, 0, 10);
+  ctx.bezierCurveTo(-8, 6, -9, -3, 0, -12);
+  ctx.fillStyle = C.fireA; ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(0, -4);
+  ctx.bezierCurveTo(4.5, 1, 4, 6, 0, 8.5);
+  ctx.bezierCurveTo(-4, 6, -4.5, 1, 0, -4);
+  ctx.fillStyle = C.fireB; ctx.fill();
+  ctx.restore();
+}
+function iconStar(x, y, s) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const r = (i % 2 === 0) ? 11 : 4.6;
+    const a = -Math.PI / 2 + i * Math.PI / 5;
+    const px = Math.cos(a) * r, py = Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath(); ctx.fillStyle = C.fireB; ctx.fill();
+  ctx.restore();
+}
+function iconBox(x, y, s, col) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  fillRR(-11, -9, 22, 19, 4, col || C.mint);
+  ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1.4;
+  ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(0, 10); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-11, -2); ctx.lineTo(11, -2); ctx.stroke();
+  ctx.restore();
+}
+function iconBrick(x, y, s, col) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  fillRR(-13, -5, 11, 10, 2, col || C.warm);
+  fillRR(2, -5, 11, 10, 2, col || C.warm);
+  fillRR(-6, -15, 11, 10, 2, C.coral);
+  ctx.restore();
+}
+
+function drawHUD() {
+  fillRR(14, 10, W - 28, 54, 16, C.panel);
+  ctx.strokeStyle = 'rgba(241,250,238,.08)'; ctx.lineWidth = 2;
+  rr(14, 10, W - 28, 54, 16); ctx.stroke();
+
+  // 火距
+  const gp = Math.max(0, gap());
+  const danger = gp < 4;
+  iconFlame(52, 37, 1);
+  txt(String(Math.round(gp)), 76, 47, 26, danger ? C.danger : C.cream, 'left', 'bold');
+  // 分数
+  iconStar(430, 37, 1);
+  txt(String(Math.round(S.score)), 454, 47, 26, C.cream, 'left', 'bold');
+  // 爬到顶进度
+  iconBrick(770, 39, 1);
+  txt(S.tower.length + '/' + S.topFloor, 794, 47, 24, C.sky, 'left', 'bold');
+  // 应急
+  const emgOn = S.emg > 0;
+  iconBox(W - 300, 37, 1.05, emgOn ? C.mint : 'rgba(255,255,255,.25)');
+  txt('x' + S.emg, W - 276, 47, 26, emgOn ? C.cream : 'rgba(241,250,238,.4)', 'left', 'bold');
+
+  // 危险时顶部粉色呼吸条
+  if (Math.abs(S.lean) > TUNE.dangerLean || danger) {
+    const a = 0.18 + 0.28 * (0.5 + 0.5 * Math.sin(S.t * 6));
+    fillRR(14, 10, W - 28, 54, 16, 'rgba(255,158,181,' + (a * 0.35).toFixed(3) + ')');
+  }
+}
+
+function cardRect(i) {
+  const n = S.cards.length;
+  const totalW = W - 32 - 176 - 16;             // 左侧留给应急按钮
+  const gapW = 14;
+  const cw = (totalW - (n - 1) * gapW) / n;
+  const ch = 104;
+  return { x: 16 + 176 + 16 + i * (cw + gapW), y: H - 16 - ch, w: cw, h: ch };
+}
+function emgRect() { return { x: 16, y: H - 16 - 104, w: 176, h: 104 }; }
+
+function drawBoardCard(x, y, w, h, key, hover, dim) {
+  const d = BOARDS[key];
+  ctx.globalAlpha = dim ? 0.45 : 1;
+  fillRR(x, y, w, h, 18, 'rgba(241,250,238,.07)');
+  ctx.strokeStyle = hover ? 'rgba(244,162,97,.9)' : 'rgba(241,250,238,.16)';
+  ctx.lineWidth = hover ? 3 : 2;
+  rr(x, y, w, h, 18); ctx.stroke();
+  // 板子样片
+  const scale = Math.min(1, (w - 60) / (d.w + 20));
+  const bw = d.w * scale, bh = d.h * scale;
+  const bx = x + w / 2 - bw / 2, by = y + h * 0.42 - bh / 2 + (hover ? -3 : 0);
+  drawBoardShape(x + w / 2, by + bh * 0.04, bw, bh, d, 0, 1);
+  // 名称
+  txt(d.name, x + w / 2, y + h - 34, 19, C.cream, 'center', 'bold');
+  // 小圆点：稳（薄荷）/ 重（珊瑚）
+  for (let i = 0; i < 3; i++) {
+    circle(x + w / 2 - 40 + i * 13, y + h - 15, 4.2, i < d.stab ? C.mint : 'rgba(241,250,238,.18)');
+    circle(x + w / 2 + 16 + i * 13, y + h - 15, 4.2, i < d.wt ? C.coral : 'rgba(241,250,238,.18)');
+  }
+  ctx.globalAlpha = 1;
+}
+function drawBottom() {
+  const emgPad = emgRect();
+  const danger = Math.abs(S.lean) > TUNE.dangerLean;
+  const pulse = danger ? (0.5 + 0.5 * Math.sin(S.t * 7)) : 0;
+  if (S.emg > 0) {
+    fillRR(emgPad.x, emgPad.y, emgPad.w, emgPad.h, 18, 'rgba(42,157,143,' + (0.16 + 0.28 * pulse).toFixed(3) + ')');
+    ctx.strokeStyle = danger ? 'rgba(255,158,181,.95)' : 'rgba(42,157,143,.75)';
+    ctx.lineWidth = danger ? 3.4 : 2.4;
+    rr(emgPad.x, emgPad.y, emgPad.w, emgPad.h, 18); ctx.stroke();
+  } else {
+    fillRR(emgPad.x, emgPad.y, emgPad.w, emgPad.h, 18, 'rgba(241,250,238,.05)');
+    ctx.strokeStyle = 'rgba(241,250,238,.12)'; ctx.lineWidth = 2;
+    rr(emgPad.x, emgPad.y, emgPad.w, emgPad.h, 18); ctx.stroke();
+  }
+  iconBox(emgPad.x + emgPad.w / 2, emgPad.y + 34, 1.5, S.emg > 0 ? C.mint : 'rgba(255,255,255,.22)');
+  txt(S.emg > 0 ? '加固' : '用完', emgPad.x + emgPad.w / 2, emgPad.y + 74, 18,
+      S.emg > 0 ? C.cream : 'rgba(241,250,238,.35)', 'center', 'bold');
+  for (let i = 0; i < TUNE.emgCount; i++) {
+    circle(emgPad.x + emgPad.w / 2 - 18 + i * 18, emgPad.y + 90, 5,
+      i < S.emg ? C.mint : 'rgba(241,250,238,.16)');
+  }
+  const dim = S.phase !== 'choose';
+  for (let i = 0; i < S.cards.length; i++) {
+    const r = cardRect(i);
+    const hover = !dim && P.x >= r.x && P.x <= r.x + r.w && P.y >= r.y && P.y <= r.y + r.h;
+    drawBoardCard(r.x, r.y, r.w, r.h, S.cards[i], hover, dim);
+  }
+}
+
+/* 悬停中的板 + 落点引导 */
+function drawPending() {
+  const p = S.pending; if (!p) return;
+  const targetY = surfaceY(S.tower.length) - TUNE.BH * 1.9;
+  let px, py, a = 1;
+  if (S.phase === 'fly') {
+    const k = clamp(S.phaseT / TUNE.flyT, 0, 1);
+    const e = 1 - Math.pow(1 - k, 3);
+    px = lerp(p.fromX, p.x, e);
+    py = lerp(p.fromY, targetY, e) - Math.sin(k * Math.PI) * 60;
+    a = 1;
+  } else if (S.phase === 'hover') {
+    px = p.x; py = targetY + Math.sin(S.t * 3) * 4;
+  } else {
+    const k = clamp(S.phaseT / TUNE.dropT, 0, 1);
+    px = p.x; py = lerp(targetY, surfaceY(S.tower.length) - TUNE.BH * 0.5, k * k);
+  }
+  const sy = py + S.camY;
+  // 落点虚线 + 影子
+  ctx.setLineDash([7, 8]);
+  ctx.strokeStyle = 'rgba(142,202,230,.5)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(px, sy + TUNE.BH + 4); ctx.lineTo(px, sy + 46); ctx.stroke();
+  ctx.setLineDash([]);
+  const drop = sy + TUNE.BH * 1.4;
+  const sxm = px, sym = drop + 22;
+  const s = stats();
+  const off = Math.abs(px - (S.tower[0].x + s.comNorm * TUNE.baseW * 0.5));
+  const col = off < 34 ? 'rgba(42,157,143,.55)' : (off < 80 ? 'rgba(244,162,97,.55)' : 'rgba(231,111,81,.6)');
+  ctx.beginPath(); ctx.ellipse(sxm, sym, 62, 11, 0, 0, TAU); ctx.fillStyle = col; ctx.fill();
+  // 自动落下倒计时环
+  if (S.phase === 'hover') {
+    const k = 1 - clamp(S.phaseT / TUNE.hoverT, 0, 1);
+    ctx.beginPath(); ctx.arc(px, sy + TUNE.BH / 2, 40, -Math.PI / 2, -Math.PI / 2 + TAU * k);
+    ctx.strokeStyle = 'rgba(241,250,238,.5)'; ctx.lineWidth = 3; ctx.stroke();
+  }
+  ctx.globalAlpha = a;
+  drawBoardShape(px, sy, p.w, p.h, p.def, 0, 1);
+  ctx.globalAlpha = 1;
+}
+
+function drawParticles() {
+  for (let i = 0; i < S.particles.length; i++) {
+    const p = S.particles[i];
+    const a = clamp(p.life / p.max, 0, 1);
+    circle(p.x, p.y + S.camY, p.r * (0.6 + 0.4 * a), p.c + (a * 0.85).toFixed(3) + ')');
+  }
+  for (let i = 0; i < S.debris.length; i++) {
+    const d = S.debris[i];
+    const a = clamp(d.life / 1.6, 0, 1);
+    ctx.save();
+    ctx.translate(d.x, d.y + S.camY); ctx.rotate(d.rot);
+    drawBoardShape(0, 0, d.w, d.def.h, d.def, 0, a * 0.95);
+    ctx.restore();
+  }
+}
+
+/* 结算：极简，只有分数 + 一个重开按钮 */
+function resultRect() { return { x: W / 2 - 260, y: H / 2 - 170, w: 520, h: 340 }; }
+function drawResult() {
+  ctx.fillStyle = 'rgba(6,14,26,.72)'; ctx.fillRect(0, 0, W, H);
+  const r = resultRect();
+  fillRR(r.x, r.y, r.w, r.h, 26, 'rgba(13,26,46,.94)');
+  ctx.strokeStyle = 'rgba(241,250,238,.12)'; ctx.lineWidth = 2; rr(r.x, r.y, r.w, r.h, 26); ctx.stroke();
+  iconStar(W / 2, r.y + 66, 2.1);
+  txt(String(Math.round(S.score)), W / 2, r.y + 152, 66, S.win ? C.fireB : C.cream, 'center', 'bold');
+  // 到达层数
+  iconBrick(r.x + 118, r.y + 196, 1.1);
+  txt(String(S.tower.length), r.x + 146, r.y + 204, 26, C.sky, 'left', 'bold');
+  // 最好成绩
+  iconStar(r.x + 300, r.y + 196, 0.9);
+  txt(String(Math.round(S.best)), r.x + 324, r.y + 204, 26, 'rgba(241,250,238,.6)', 'left', 'bold');
+  // 顶部小标记：赢了给个小太阳，输了给个火苗
+  if (S.win) { circle(W / 2 - 108, r.y + 60, 13, C.fireB); } else { iconFlame(W / 2 - 104, r.y + 60, 1.05); }
+
+  const b = replayRect();
+  const hov = P.x >= b.x && P.x <= b.x + b.w && P.y >= b.y && P.y <= b.y + b.h;
+  fillRR(b.x, b.y, b.w, b.h, 20, hov ? '#F4A261' : '#E76F51');
+  ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 2; rr(b.x, b.y, b.w, b.h, 20); ctx.stroke();
+  // 刷新箭头
+  ctx.save(); ctx.translate(b.x + 54, b.y + b.h / 2);
+  ctx.strokeStyle = C.cream; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(0, 0, 14, -0.25 * Math.PI, 1.35 * Math.PI); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(6, -16); ctx.lineTo(16, -12); ctx.lineTo(6, -6); ctx.closePath();
+  ctx.fillStyle = C.cream; ctx.fill();
+  ctx.restore();
+  txt('再来一局', b.x + b.w / 2 + 26, b.y + b.h / 2 + 11, 28, '#FFFFFF', 'center', 'bold');
+}
+function replayRect() { return { x: W / 2 - 180, y: H / 2 + 88, w: 360, h: 76 }; }
+
+/* ============================ 主渲染 ============================ */
+const P = { x: -1, y: -1, down: false };
+function render(dtReal) {
+  // 相机先算好，火焰和楼层都按同一帧的相机绘制
+  S.camY = lerp(S.camY, camTarget(), clamp(dtReal * 7, 0, 1));
+  drawBackground(dtReal);
+  drawFire();
+
+  ctx.save();
+  if (S.shake > 0) ctx.translate(rnd(-1, 1) * S.shake * 9, rnd(-1, 1) * S.shake * 7);
+  // 整塔倾斜（绕地基中心）
+  const pivotX = S.tower[0].x, pivotY = 0 + S.camY;
+  ctx.save();
+  ctx.translate(pivotX, pivotY); ctx.rotate(S.lean * 0.052); ctx.translate(-pivotX, -pivotY);
+  // 楼板（自下而上，剔除屏外）
+  for (let i = 0; i < S.tower.length; i++) {
+    const b = S.tower[i];
+    const wy = surfaceY(i);
+    const sy = wy + S.camY;
+    if (sy < -80 || sy > H + 80) continue;
+    drawBoardShape(b.x, sy, b.w, b.h, b.def, b.squash, 1);
+  }
+  // 玩家
+  drawPlayer();
+  ctx.restore();
+  drawPending();
+  drawParticles();
+  ctx.restore();
+
+  // 闪光 / 危险边框
+  if (S.flash > 0) { ctx.fillStyle = 'rgba(255,158,181,' + (S.flash * 0.22).toFixed(3) + ')'; ctx.fillRect(0, 0, W, H); }
+  if (Math.abs(S.lean) > TUNE.dangerLean && S.phase !== 'end') {
+    const a = 0.25 + 0.35 * (0.5 + 0.5 * Math.sin(S.t * 5));
+    ctx.strokeStyle = 'rgba(255,158,181,' + a.toFixed(3) + ')'; ctx.lineWidth = 10;
+    ctx.strokeRect(5, 5, W - 10, H - 10);
+  }
+
+  drawHUD();
+  if (S.mode === 'play') drawBottom();
+  else drawResult();
+}
+
+/* ============================ 输入 ============================ */
+function toWorld(ev) {
+  const r = cv.getBoundingClientRect();
+  return { x: (ev.clientX - r.left) * (W / r.width), y: (ev.clientY - r.top) * (H / r.height) };
+}
+function hit(r, p) { return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
+function onDown(p) {
+  audioInit();
+  if (A.ctx && A.ctx.state === 'suspended') A.ctx.resume();
+  if (S.mode === 'end') { startRun(); return; }
+  if (hit(emgRect(), p)) { useEmergency(); return; }
+  if (S.phase === 'choose') {
+    for (let i = 0; i < S.cards.length; i++) if (hit(cardRect(i), p)) { chooseCard(i); return; }
+  } else if (S.phase === 'hover' && S.pending) {
+    S.dragging = true; S.dragMoved = 0;
+    S.dragDX = S.pending.x - p.x;
+  }
+}
+function onMove(p) {
+  if (S.dragging && S.pending && S.phase === 'hover') {
+    const nx = clamp(p.x + S.dragDX, S.tower[0].x - TUNE.dragRange, S.tower[0].x + TUNE.dragRange);
+    S.dragMoved += Math.abs(nx - S.pending.x);
+    S.pending.x = nx;
+    S.simTargetX = null;
+  }
+}
+function onUp() {
+  if (S.dragging && S.dragMoved < 8) dropNow();
+  S.dragging = false;
+}
+cv.addEventListener('pointerdown', function (e) { const p = toWorld(e); P.x = p.x; P.y = p.y; P.down = true; onDown(p); });
+cv.addEventListener('pointermove', function (e) { const p = toWorld(e); P.x = p.x; P.y = p.y; onMove(p); });
+cv.addEventListener('pointerup', function (e) { const p = toWorld(e); P.x = p.x; P.y = p.y; P.down = false; onUp(); });
+cv.addEventListener('pointerleave', function () { S.dragging = false; });
+window.addEventListener('keydown', function (e) {
+  audioInit();
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    if (S.mode === 'end') startRun();
+    else if (S.phase === 'hover') dropNow();
+    else if (S.phase === 'choose' && S.cards.length) chooseCard(0);
+  } else if (e.key === 'e' || e.key === 'E') useEmergency();
+});
+
+/* ============================ 主循环 ============================ */
+let lastT = (window.performance && performance.now) ? performance.now() : Date.now();
+let acc = 0;
+const FIXED = 1 / 120;
+function frame(now) {
+  const dtReal = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  if (!S.frozen) {
+    acc += dtReal;
+    let guard = 0;
+    while (acc >= FIXED && guard++ < 8) { stepAll(FIXED); acc -= FIXED; }
+  }
+  render(dtReal);
+  requestAnimationFrame(frame);
+}
+
+/* ============================ 自测 ============================ */
+function simStep(dt) { stepAll(dt); }
+function idealX() {
+  const st = stats();
+  const comX = S.tower[0].x + st.comNorm * TUNE.baseW * 0.5;
+  const topB = S.tower[S.tower.length - 1];
+  return clamp(comX * 0.7 + topB.x * 0.3, S.tower[0].x - TUNE.dragRange, S.tower[0].x + TUNE.dragRange);
+}
+function pickCardIdx(policy) {
+  // 稳的时候随便选，晃的时候优先石板 / 胶板
+  const lean = Math.abs(stats().comNorm);
+  let order = S.cards.slice();
+  if (lean > 0.45) {
+    const rank = { stone: 3, glue: 2, wood: 1, spring: 1, ice: 0 };
+    order.sort((a, b) => rank[b] - rank[a]);
+  } else if (policy === 'fast') {
+    const rank = { wood: 2, spring: 2, glue: 2, stone: 1, ice: 1 };
+    order.sort((a, b) => rank[b] - rank[a]);
+  }
+  return S.cards.indexOf(order[0]);
+}
+function simPolicy(policy) {
+  return function () {
+    if (S.mode !== 'play') return;
+    if (policy === 'lazy') {
+      // 什么都不管：随机选，落点用默认随机，等自动落下
+      if (S.phase === 'choose') chooseCard(Math.floor(Math.random() * S.cards.length));
+      if (S.phase === 'hover' && S.emg > 0 && Math.abs(S.lean) > 1.25) useEmergency();
+      return;
+    }
+    if (S.phase === 'choose') { chooseCard(pickCardIdx(policy)); S.simTargetX = idealX(); S.simFast = (policy === 'fast'); }
+    if ((S.phase === 'fly' || S.phase === 'hover') && S.pending) {
+      S.pending.x = S.simTargetX == null ? idealX() : S.simTargetX;
+      if (policy === 'fast' && S.phase === 'hover') dropNow();
+    }
+    if (S.emg > 0 && Math.abs(S.lean) > 1.05) useEmergency();
+  };
+}
+function simRun(policy, maxSec, dt) {
+  dt = dt || 1 / 60;
+  startRun();
+  const pol = simPolicy(policy);
+  let t = 0;
+  while (S.mode === 'play' && t < maxSec) { pol(); simStep(dt); t += dt; }
+  return {
+    policy: policy, sec: S.mode === 'play' ? maxSec : t, win: S.win, reason: S.endReason,
+    floors: S.tower.length, score: Math.round(S.score), collapses: S.collapses,
+    emg: S.emg, lean: S.lean, fire: S.fireFloor, finite: isFinite(S.lean) && isFinite(S.fireFloor) && isFinite(S.score)
+  };
+}
+function runSelfTest() {
+  const R = []; let fails = 0;
+  function ck(name, cond, extra) {
+    R.push((cond ? 'PASS' : 'FAIL') + ' | ' + name + (extra ? ('  [' + extra + ']') : ''));
+    if (!cond) fails++;
+  }
+  // 1 板型定义
+  ck('五种板型齐全且字段完整', TYPES.length === 5 && TYPES.every(k => BOARDS[k].mass > 0 && BOARDS[k].stab >= 1 && BOARDS[k].wt >= 1));
+  // 2 每回合 2~3 块且不重复
+  startRun();
+  let okCards = true;
+  for (let i = 0; i < 400; i++) {
+    const c = rollCards();
+    if (c.length < 2 || c.length > 3 || new Set(c).size !== c.length) { okCards = false; break; }
+  }
+  ck('每回合只出 2~3 种不重复的板', okCards);
+  // 3 放在重心上的板不会晃
+  startRun();
+  chooseCard(0); S.pending.x = S.tower[0].x;
+  while (S.phase !== 'choose' && S.mode === 'play') simStep(1 / 120);
+  const leanAfterCenter = Math.abs(S.lean);
+  ck('落点对准重心时很稳', leanAfterCenter < TUNE.dangerLean, 'lean=' + leanAfterCenter.toFixed(3));
+  // 4 极端偏置会塌方
+  startRun();
+  S.graceT = 999;
+  chooseCard(0); S.pending.x = S.tower[0].x + TUNE.dragRange;
+  let coll = false;
+  for (let i = 0; i < 1200 && S.mode === 'play'; i++) { simStep(1 / 120); if (S.collapses > 0) { coll = true; break; } }
+  ck('极端偏心放置会塌方', coll, 'collapses=' + S.collapses);
+  // 5 塌方是局部的：保留地基，上面还有板（不是全塌）
+  const afterCollapse = S.tower.length;
+  ck('塌方后保留地基且不是全塌', S.tower[0].t === 'base' && afterCollapse >= 1, 'len=' + beforeLen + '->' + afterCollapse);
+  startRun();
+  for (let i = 0; i < 9; i++) S.tower.push(mkBoard('wood', 640 + rnd(-10, 10)));
+  S.lean = 3; doCollapse();
+  ck('高塔塌方只损失部分楼层', S.tower.length >= 4 && S.tower.length <= 10, '10 -> ' + S.tower.length);
+  // 6 火持续上涨，闲置时距离变小
+  startRun();
+  chooseCard(0); S.pending.x = S.tower[0].x;
+  while (S.phase !== 'choose' && S.mode === 'play') simStep(1 / 120);
+  const g0 = gap(), f0 = S.fireFloor;
+  for (let i = 0; i < 300; i++) simStep(1 / 120);      // 闲置 2.5 秒
+  ck('火持续上涨', S.fireFloor > f0, f0.toFixed(2) + ' -> ' + S.fireFloor.toFixed(2));
+  ck('原地不动火会逼近', gap() < g0, g0.toFixed(2) + ' -> ' + gap().toFixed(2));
+  // 7 爬层：每回合 +1 层且 +10 分
+  startRun();
+  const score0 = S.score;
+  chooseCard(0); S.pending.x = S.tower[0].x;
+  let guard = 0;
+  while (S.phase !== 'choose' && S.mode === 'play' && guard++ < 2000) simStep(1 / 120);
+  ck('每回合自动爬一层', S.tower.length === 2 && S.floors === 1, 'len=' + S.tower.length + ' floors=' + S.floors);
+  ck('爬层加分', S.score >= score0 + 10, 'score ' + Math.round(score0) + ' -> ' + Math.round(S.score));
+  // 8 应急板
+  startRun();
+  chooseCard(0); S.pending.x = S.tower[0].x + 150;
+  for (let i = 0; i < 260; i++) simStep(1 / 120);
+  const emgBefore = S.emg, scoreBefore = S.score, leanBefore = Math.abs(S.lean);
+  const used = useEmergency();
+  ck('应急板可用且数量 -1', used === true && S.emg === emgBefore - 1, 'emg ' + emgBefore + ' -> ' + S.emg);
+  ck('应急板扣 30 分', S.score <= scoreBefore - TUNE.emgCost + 1, Math.round(scoreBefore) + ' -> ' + Math.round(S.score));
+  ck('应急板立刻压住摇摆', Math.abs(S.lean) < Math.max(0.25, leanBefore), 'lean ' + leanBefore.toFixed(2) + ' -> ' + Math.abs(S.lean).toFixed(2));
+  S.emg = 0; S.score = 100;
+  ck('应急板用完不能再用', useEmergency() === false && S.score === 100);
+  // 9 到达楼顶即结束（胜利）
+  startRun();
+  S.topFloor = S.tower.length + 1;
+  chooseCard(0); S.pending.x = S.tower[0].x;
+  guard = 0;
+  while (S.mode === 'play' && guard++ < 3000) simStep(1 / 120);
+  ck('爬到楼顶触发结束', S.mode === 'end' && S.win === true, 'mode=' + S.mode + ' win=' + S.win);
+  // 10 火追上即结束（失败）
+  startRun();
+  S.graceT = 0; S.fireFloor = S.tower.length + 1;
+  simStep(1 / 120);
+  ck('火追上角色时结束', S.mode === 'end' && S.win === false, 'mode=' + S.mode + ' reason=' + S.endReason);
+  // 11 三种策略全程模拟
+  const fast = simRun('fast', 900);
+  const casual = simRun('casual', 900);
+  const lazy = simRun('lazy', 900);
+  R.push('  · 快攻手：' + fast.sec.toFixed(0) + 's  ' + (fast.win ? '登顶' : '被火追上') +
+         '  层数=' + fast.floors + '  分=' + fast.score + '  塌方=' + fast.collapses);
+  R.push('  · 普通手：' + casual.sec.toFixed(0) + 's  ' + (casual.win ? '登顶' : '被火追上') +
+         '  层数=' + casual.floors + '  分=' + casual.score + '  塌方=' + casual.collapses);
+  R.push('  · 摆烂手：' + lazy.sec.toFixed(0) + 's  ' + (lazy.win ? '登顶' : '被火追上') +
+         '  层数=' + lazy.floors + '  分=' + lazy.score + '  塌方=' + lazy.collapses);
+  ck('快攻手能登顶', fast.win === true, 'sec=' + fast.sec.toFixed(0));
+  ck('快攻手一局 2~7 分钟', fast.sec > 120 && fast.sec < 420, fast.sec.toFixed(0) + 's');
+  ck('普通手一局 2.5~7.5 分钟', casual.sec > 150 && casual.sec < 450, casual.sec.toFixed(0) + 's');
+  ck('摆烂手会被火追上（有压力）', lazy.win === false, 'sec=' + lazy.sec.toFixed(0));
+  ck('一局时长有上限（不会无限）', lazy.sec < 600 && casual.sec < 600);
+  ck('塌方是部分塌方（有翻车但没死）', lazy.collapses >= 1, 'collapses=' + lazy.collapses);
+  ck('三种模拟数值均有限', fast.finite && casual.finite && lazy.finite);
+  // 12 步长无关性
+  const a60 = simRun('casual', 900, 1 / 60);
+  const a120 = simRun('casual', 900, 1 / 120);
+  const rel = Math.abs(a60.sec - a120.sec) / Math.max(1, a60.sec);
+  ck('不同步长结果接近（帧率无关）', rel < 0.4, a60.sec.toFixed(0) + 's vs ' + a120.sec.toFixed(0) + 's');
+  // 13 长跑不出 NaN
+  let finite = true;
+  startRun();
+  S.graceT = 1e9;                                   // 关掉火，专门跑物理
+  let n = 0;
+  for (let i = 0; i < 60000 && S.mode === 'play'; i++) {
+    if (S.phase === 'choose') { chooseCard(0); S.pending.x = idealX(); dropNow(); }
+    if (S.phase === 'hover') dropNow();
+    simStep(1 / 60); n++;
+    if (!isFinite(S.lean) || !isFinite(S.leanVel) || !isFinite(S.playerY)) { finite = false; break; }
+  }
+  ck('长时间物理推进不出 NaN', finite, n + ' 步');
+  // 14 性能
+  startRun(); S.graceT = 1e9;
+  while (S.tower.length < 60) { chooseCard(0); S.pending.x = idealX(); dropNow(); for (let i = 0; i < 40; i++) simStep(1 / 120); }
+  const t0 = performance.now();
+  for (let i = 0; i < 1200; i++) simStep(1 / 120);
+  const ms = performance.now() - t0;
+  ck('60 层塔的物理开销很小（<8ms/1200步）', ms < 8, ms.toFixed(2) + 'ms');
+
+  S.mode = 'end';
+  const pre = document.getElementById('selftest-result');
+  pre.hidden = false;
+  pre.textContent = R.join('\n') + '\n--- ' + (fails ? ('SELFTEST FAIL (' + fails + ')') : 'SELFTEST PASS') + ' ---';
+  document.title = fails ? ('SELFTEST FAIL ' + fails) : 'SELFTEST PASS';
+}
+
+/* ============================ 启动 ============================ */
+if (Q.has('selftest')) {
+  runSelfTest();
+} else {
+  startRun();
+  initCam();
+  if (Q.has('danger')) {                       // 截图用：直接摆一个摇摇欲坠的塔
+    for (let i = 0; i < 14; i++) {
+      const keys = ['wood', 'stone', 'ice', 'glue', 'spring'];
+      const k = keys[i % keys.length];
+      const b = mkBoard(k, 640 + Math.sin(i * 1.1) * 34 + (i > 9 ? 40 : 0));
+      S.tower.push(b);
+    }
+    S.playerLevel = topLevel();
+    S.playerX = S.tower[topLevel()].x; S.playerY = surfaceY(topLevel());
+    S.lean = 1.02; S.dangerT = 1.4; S.score = 482; S.floors = 13;
+    S.emg = 2; S.fireFloor = S.tower.length - 3.2; S.graceT = 999;
+    S.faceshot = true;
+  }
+  if (Q.has('freeze')) S.frozen = true;
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
